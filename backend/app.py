@@ -23,15 +23,18 @@ AUDIO_DIR = os.path.join(BASE_DIR, 'static')
 if not os.path.exists(AUDIO_DIR):
     os.makedirs(AUDIO_DIR)
 
-API_KEY = os.environ.get("GEMINI_API_KEY")
+# Проверяем оба возможных названия ключа (для локальной работы и для Render)
+API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("API_KEY")
 
+client = None
 try:
     if not API_KEY:
-        raise ValueError(f"Ключ не найден в {BASE_DIR}")
-    client = genai.Client(api_key=API_KEY)
-    print("--- УСПЕХ: Google GenAI запущен! ---")
+        print(f"--- ПРЕДУПРЕЖДЕНИЕ: Ключ API пока не найден в окружении. Попробуем получить его при запросе. ---")
+    else:
+        client = genai.Client(api_key=API_KEY)
+        print("--- УСПЕХ: Google GenAI запущен! ---")
 except Exception as init_e:
-    print(f"--- ОШИБКА: {init_e} ---")
+    print(f"--- ОШИБКА ИНИЦИАЛИЗАЦИИ: {init_e} ---")
 
 
 # --- ФУНКЦИЯ ПОЛУЧЕНИЯ ХРОНОЛОГИИ (ВРЕМЯ, ДАТА, ДЕНЬ НЕДЕЛИ) ---
@@ -73,7 +76,7 @@ def detect_voice(text):
         return "en-US-BrianNeural"
 
 
-# --- 3. СИНХРОННАЯ ГЕНЕРАЦИЯ АУДИО (ИЗБЕГАЕМ 404 НА ФРОНТЕНДЕ) ---
+# --- 3. СИНХРОННАЯ ГЕНЕРАЦИЯ АУДИО ---
 def generate_audio_sync(text, output_path, voice):
     async def tts_task():
         try:
@@ -106,15 +109,23 @@ def generate_audio_sync(text, output_path, voice):
 
 
 # --- 4. КЛЮЧЕВЫЕ СЛОВА ДЛЯ МУЗЫКИ ---
-MUSIC_KEYWORDS = ["включи музыку", "поставь песню", "поставь музыку", "играй музыку", "play music"]
+music_keywords = ["включи музыку", "поставь песню", "поставь музыку", "играй музыку", "play music"]
 
 
 @app.route('/api/assistant', methods=['POST'])
 def assistant():
-    data = request.json
+    global client
+    data = request.json or {}
     user_message = data.get('message', [])
 
     try:
+        # Умная проверка инициализации ИИ клиента перед запросом
+        if client is None:
+            current_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("API_KEY")
+            if not current_key:
+                raise ValueError("Ключ API (GEMINI_API_KEY или API_KEY) полностью отсутствует в переменных окружения сервера!")
+            client = genai.Client(api_key=current_key)
+
         history_text = ""
         image_parts = []
         last_text_message = ""
@@ -142,9 +153,9 @@ def assistant():
             last_text_message = str(user_message).lower()
 
         # =====================================================================
-        # БЛОК 1: ПЕРЕХВАТ МУЗЫКИ (ЭКОНОМИЯ ТОКЕНОВ GEMINI)
+        # БЛОК 1: ПЕРЕХВАТ МУЗЫКИ
         # =====================================================================
-        if any(keyword in last_text_message for keyword in MUSIC_KEYWORDS):
+        if any(keyword in last_text_message for keyword in music_keywords):
             reply_text = "Включаю музыку. Наслаждайся!"
             speech_text = clean_text_for_speech(reply_text)
             chosen_voice = detect_voice(speech_text)
@@ -152,7 +163,7 @@ def assistant():
             audio_filename = f"music_{int(time.time())}.mp3"
             audio_path = os.path.join(AUDIO_DIR, audio_filename)
             audio_url = f"{request.host_url}static/{audio_filename}"
-            # Генерируем голос
+            
             generate_audio_sync(speech_text, audio_path, chosen_voice)
             
             return jsonify({
@@ -164,8 +175,6 @@ def assistant():
         # =====================================================================
         # БЛОК 2: СТАНДАРТНЫЙ ЗАПРОС К ИИ (GEMINI)
         # =====================================================================
-        
-        # Вычисляем точное системное время в момент запроса
         actual_time_data = get_current_time_info()
 
         prompt = f"""Ты — Захар, искусственный интеллект и голосовой ассистент от компании Voxel Rivo. 
@@ -179,7 +188,8 @@ def assistant():
 Если в вопросе пользователя есть запрос на текущее время, дату, год или день недели, всегда отвечай СТРОГО на основе этих предоставленных данных. Не придумывай время из головы и не гадай его! Говори точные данные для того города или страны (например, Армения, Ереван или Москва), о которых спросил пользователь.
 
 ЖЕСТКОЕ ПРАВИЛО ПРИВЕТСТВИЯ:
-Если это самое первое сообщение в диалоге или пользователь просто поздоровался ("привет", "здравствуй", "hi", "hello"), ты должен начать свой ответ строго со следующего фирменного приветствия:
+If this is the first message or a greeting, you MUST start with the welcome message translated to the user's language.
+Например, для русского языка:
 «Привет! Я Захар — голосовой ассистент экосистемы Voxel Rivo. Рад помочь тебе»
 Если пользователь пишет на другом языке (например, армянском или английском), переведи эту фразу на язык пользователя, но сохрани структуру, имя Захар !
 
@@ -217,7 +227,7 @@ def assistant():
             audio_filename = f"reply_{int(time.time())}.mp3"
             audio_path = os.path.join(AUDIO_DIR, audio_filename)
             audio_url = f"{request.host_url}static/{audio_filename}"
-            # Ждем генерации аудио, чтобы фронтенд гарантированно получил готовый файл
+            
             generate_audio_sync(speech_text, audio_path, chosen_voice)
 
             return jsonify({
@@ -237,7 +247,7 @@ def assistant():
         elif "429" in error_msg:
             friendly_answer = "Ой, мы отправляем запросы слишком быстро! Мой лимит временно исчерпан. Подожди ровно 1 минуту."
         else:
-            friendly_answer = f"Произошла непредвиденная ошибка связи. Сообщи Алику об этом! (Код: {error_msg[:30]})"
+            friendly_answer = f"Произошла непредвиденная ошибка связи. Сообщи Алику об этом! (Код: {error_msg[:50]})"
 
         return jsonify({
             "answer": friendly_answer,
