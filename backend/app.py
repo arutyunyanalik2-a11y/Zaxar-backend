@@ -151,8 +151,7 @@ def assistant():
             
             audio_filename = f"music_{int(time.time())}.mp3"
             audio_path = os.path.join(AUDIO_DIR, audio_filename)
-            audio_url = f"http://127.0.0.1:5000/static/{audio_filename}"
-            
+            audio_url = f"{request.host_url}static/{audio_filename}"
             # Генерируем голос
             generate_audio_sync(speech_text, audio_path, chosen_voice)
             
@@ -217,8 +216,7 @@ def assistant():
             
             audio_filename = f"reply_{int(time.time())}.mp3"
             audio_path = os.path.join(AUDIO_DIR, audio_filename)
-            audio_url = f"http://127.0.0.1:5000/static/{audio_filename}"
-            
+            audio_url = f"{request.host_url}static/{audio_filename}"
             # Ждем генерации аудио, чтобы фронтенд гарантированно получил готовый файл
             generate_audio_sync(speech_text, audio_path, chosen_voice)
 
@@ -248,4 +246,5 @@ def assistant():
         })
 
 if __name__ == '__main__':
-    app.run(port=5000, debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
