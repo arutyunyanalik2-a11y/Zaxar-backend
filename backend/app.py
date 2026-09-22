@@ -236,7 +236,7 @@ If this is the first message or a greeting, you MUST start with the welcome mess
         })
 
 
-# --- 100% БЕСПЛАТНАЯ ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ С УМНЫМ ЭКОНОМНЫМ ПЕРЕВОДОМ ---
+# --- 100% БЕСПЛАТНАЯ ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ С ЗАЩИТОЙ ОТ ТАЙМАУТОВ ---
 @app.route('/api/generate-image', methods=['POST'])
 def generate_image():
     global client
@@ -249,17 +249,16 @@ def generate_image():
     try:
         print(f"--- [ГЕНЕРАЦИЯ] Исходный запрос: {prompt} ---")
 
-        # 1. Очищаем запрос от вводных слов («создай», «нарисуй» и т.д.)
+        # 1. Очищаем запрос от вводных слов
         clean_prompt = re.sub(r'(?i)^(создай|нарисуй|сгенерируй|покажи|create|generate|draw)\s+(картинку|изображение|фото|арт|image|picture)?\s*', '', prompt).strip()
         if not clean_prompt:
             clean_prompt = prompt
 
-        # 2. Проверяем, есть ли не-латинские символы (кириллица, армянский и т.д.)
+        # 2. Проверяем язык
         has_non_english = bool(re.search(r'[^\x00-\x7F]', clean_prompt))
         english_prompt = clean_prompt
 
         if has_non_english:
-            # Переводим ТОЛЬКО если текст не на английском
             try:
                 if client is None:
                     current_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("API_KEY")
@@ -277,29 +276,32 @@ def generate_image():
             except Exception as t_err:
                 print(f"Ошибка авто-перевода, используем оригинал: {t_err}")
         else:
-            # Если текст уже на английском — API ключ Gemini НЕ расходуется
             print(f"--- [ПРОПУСК ПЕРЕВОДА]: Текст уже на английском ({english_prompt}), API Gemini не расходуется! ---")
 
-        # 3. Отправляем переведенный/исходный промпт в FLUX
+        # 3. Отправляем промпт (размер 768x768 для ускорения ответа)
         encoded_prompt = requests.utils.quote(english_prompt)
-        image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&model=flux"
+        image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=768&height=768&nologo=true&model=flux"
         
-        response = requests.get(image_url, timeout=35)
+        # Устанавливаем таймаут 22 секунды, чтобы укладываться в ограничение сервера
+        response = requests.get(image_url, timeout=22)
         
         if response.status_code == 200:
             base64_image = base64.b64encode(response.content).decode('utf-8')
-            print("--- УСПЕХ: Точное изображение сгенерировано! ---")
+            print("--- УСПЕХ: Изображение сгенерировано! ---")
             return jsonify({
                 "image": f"data:image/png;base64,{base64_image}",
                 "prompt": prompt
             })
         else:
             print(f"[-] Ошибка генератора: статус {response.status_code}")
-            return jsonify({"error": "Не удалось сгенерировать изображение"}), 500
+            return jsonify({"error": "Сервер генерации перегружен. Повторите попытку через пару секунд."}), 503
 
+    except requests.exceptions.Timeout:
+        print("[-] Ошибка: Превышено время ожидания ответа генератора (Timeout)")
+        return jsonify({"error": "Генерация заняла слишком много времени. Попробуйте повторить запрос."}), 504
     except Exception as e:
         print(f"КРИТИЧЕСКАЯ ОШИБКА ГЕНЕРАЦИИ: {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Произошла ошибка при генерации изображения."}), 500
 
 
 if __name__ == '__main__':
