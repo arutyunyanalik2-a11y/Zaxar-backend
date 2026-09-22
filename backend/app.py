@@ -3,7 +3,8 @@ import time
 import asyncio
 import re
 import base64 
-from datetime import datetime, timedelta, timezone  # Подключаем точное время
+import requests
+from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from google import genai
@@ -23,13 +24,13 @@ AUDIO_DIR = os.path.join(BASE_DIR, 'static')
 if not os.path.exists(AUDIO_DIR):
     os.makedirs(AUDIO_DIR)
 
-# Проверяем оба возможных названия ключа (для локальной работы и для Render)
+# Проверяем оба возможных названия ключа
 API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("API_KEY")
 
 client = None
 try:
     if not API_KEY:
-        print(f"--- ПРЕДУПРЕЖДЕНИЕ: Ключ API пока не найден в окружении. Попробуем получить его при запросе. ---")
+        print("--- ПРЕДУПРЕЖДЕНИЕ: Ключ API пока не найден в окружении. Попробуем получить его при запросе. ---")
     else:
         client = genai.Client(api_key=API_KEY)
         print("--- УСПЕХ: Google GenAI запущен! ---")
@@ -37,16 +38,12 @@ except Exception as init_e:
     print(f"--- ОШИБКА ИНИЦИАЛИЗАЦИИ: {init_e} ---")
 
 
-# --- ФУНКЦИЯ ПОЛУЧЕНИЯ ХРОНОЛОГИИ (ВРЕМЯ, ДАТА, ДЕНЬ НЕДЕЛИ) ---
+# --- ФУНКЦИЯ ПОЛУЧЕНИЯ ХРОНОЛОГИИ ---
 def get_current_time_info():
-    # Получаем актуальное UTC время
     now_utc = datetime.now(timezone.utc)
-    
-    # Расчет смещения: Ереван (UTC+4), Москва (UTC+3)
     yerevan_now = now_utc + timedelta(hours=4)
     moscow_now = now_utc + timedelta(hours=3)
     
-    # Названия для форматирования вывода
     days = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
     months = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"]
     
@@ -56,9 +53,8 @@ def get_current_time_info():
     return f"Ереван (Армения): {yerevan_str}. Москва (Россия): {moscow_str}."
 
 
-# --- 1. ОЧИСТКА ТЕКСТА (БЕЗ ОБРЕЗАНИЯ) ---
+# --- 1. ОЧИСТКА ТЕКСТА ---
 def clean_text_for_speech(text):
-    # Удаляем markdown-символы (*, #, `)
     cleaned = re.sub(r'[*#`]', '', text)
     return cleaned.strip() if cleaned.strip() else "Ответ готов"
 
@@ -66,13 +62,10 @@ def clean_text_for_speech(text):
 # --- 2. АВТООПРЕДЕЛЕНИЕ ГОЛОСА ---
 def detect_voice(text):
     if re.search(r'[\u0530-\u058F]', text):
-        print("--- ДЕТЕКТОР ЯЗЫКА: Выбран армянский голос (Anahit) ---")
         return "hy-AM-AnahitNeural"
     elif re.search(r'[\u0400-\u04FF]', text):
-        print("--- ДЕТЕКТОР ЯЗЫКА: Выбран русский голос (Dmitry) ---")
         return "ru-RU-DmitryNeural"
     else:
-        print("--- ДЕТЕКТОР ЯЗЫКА: Выбран английский голос (Brian) ---")
         return "en-US-BrianNeural"
 
 
@@ -82,17 +75,13 @@ def generate_audio_sync(text, output_path, voice):
         try:
             communicate = edge_tts.Communicate(text, voice)
             await communicate.save(output_path)
-            print(f"--- ГОЛОС ГОТОВ ({voice}): {output_path} ---")
         except Exception as e:
-            print(f"!!! Ошибка TTS с голосом {voice}: {e}. Пробую резервный русский голос... !!!")
             try:
                 communicate = edge_tts.Communicate(text, "ru-RU-DmitryNeural")
                 await communicate.save(output_path)
-                print(f"--- ГОЛОС ГОТОВ (Резервный Дмитрий): {output_path} ---")
             except Exception as e2:
                 print(f"Критический сбой TTS: {e2}")
 
-    # Очистка старых файлов, чтобы папка static не переполнялась
     try:
         for f in os.listdir(AUDIO_DIR):
             file_path = os.path.join(AUDIO_DIR, f)
@@ -101,14 +90,12 @@ def generate_audio_sync(text, output_path, voice):
     except Exception as e:
         print(f"Ошибка очистки файлов: {e}")
 
-    # Запускаем создание аудио и ЖДЕМ его завершения
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(tts_task())
     loop.close()
 
 
-# --- 4. КЛЮЧЕВЫЕ СЛОВА ДЛЯ МУЗЫКИ ---
 music_keywords = ["включи музыку", "поставь песню", "поставь музыку", "играй музыку", "play music"]
 
 
@@ -119,18 +106,16 @@ def assistant():
     user_message = data.get('message', [])
 
     try:
-        # Умная проверка инициализации ИИ клиента перед запросом
         if client is None:
             current_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("API_KEY")
             if not current_key:
-                raise ValueError("Ключ API (GEMINI_API_KEY или API_KEY) полностью отсутствует в переменных окружения сервера!")
+                raise ValueError("Ключ API отсутствует в переменных окружения сервера!")
             client = genai.Client(api_key=current_key)
 
         history_text = ""
         image_parts = []
         last_text_message = ""
         
-        # Разбор входящего сообщения
         if isinstance(user_message, list):
             for msg in user_message:
                 role = "Пользователь" if msg['role'] == 'user' else "Захар"
@@ -152,9 +137,6 @@ def assistant():
             history_text = f"Пользователь: {user_message}"
             last_text_message = str(user_message).lower()
 
-        # =====================================================================
-        # БЛОК 1: ПЕРЕХВАТ МУЗЫКИ
-        # =====================================================================
         if any(keyword in last_text_message for keyword in music_keywords):
             reply_text = "Включаю музыку. Наслаждайся!"
             speech_text = clean_text_for_speech(reply_text)
@@ -172,13 +154,10 @@ def assistant():
                 "action": "play_music"
             })
 
-        # =====================================================================
-        # БЛОК 2: СТАНДАРТНЫЙ ЗАПРОС К ИИ (GEMINI)
-        # =====================================================================
         actual_time_data = get_current_time_info()
 
         prompt = f"""Ты — Захар, искусственный интеллект и голосовой ассистент от компании Voxel Rivo. 
-                твой создатель — Алик.
+твой создатель — Алик.
 Твой стиль общения: дружелюбный, но лаконичный и профессиональный. 
 Ты не интегрирован в умных колонках.
 Избегай лишней «воды», заезженных метафор и слишком длинных вступлений. 
@@ -255,6 +234,73 @@ If this is the first message or a greeting, you MUST start with the welcome mess
             "audio_url": None,
             "action": None
         })
+
+
+# --- 100% БЕСПЛАТНАЯ ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ С УМНЫМ ЭКОНОМНЫМ ПЕРЕВОДОМ ---
+@app.route('/api/generate-image', methods=['POST'])
+def generate_image():
+    global client
+    data = request.json or {}
+    prompt = data.get('prompt', '')
+
+    if not prompt:
+        return jsonify({"error": "Нет описания для изображения"}), 400
+
+    try:
+        print(f"--- [ГЕНЕРАЦИЯ] Исходный запрос: {prompt} ---")
+
+        # 1. Очищаем запрос от вводных слов («создай», «нарисуй» и т.д.)
+        clean_prompt = re.sub(r'(?i)^(создай|нарисуй|сгенерируй|покажи|create|generate|draw)\s+(картинку|изображение|фото|арт|image|picture)?\s*', '', prompt).strip()
+        if not clean_prompt:
+            clean_prompt = prompt
+
+        # 2. Проверяем, есть ли не-латинские символы (кириллица, армянский и т.д.)
+        has_non_english = bool(re.search(r'[^\x00-\x7F]', clean_prompt))
+        english_prompt = clean_prompt
+
+        if has_non_english:
+            # Переводим ТОЛЬКО если текст не на английском
+            try:
+                if client is None:
+                    current_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("API_KEY")
+                    if current_key:
+                        client = genai.Client(api_key=current_key)
+                
+                if client:
+                    translation_res = client.models.generate_content(
+                        model='gemini-2.5-flash',
+                        contents=f"Translate this prompt into precise English for AI image generation. Return ONLY the English translation, no other words: {clean_prompt}"
+                    )
+                    if translation_res.text:
+                        english_prompt = translation_res.text.strip()
+                        print(f"--- [ПЕРЕВОД GEMINI]: {english_prompt} ---")
+            except Exception as t_err:
+                print(f"Ошибка авто-перевода, используем оригинал: {t_err}")
+        else:
+            # Если текст уже на английском — API ключ Gemini НЕ расходуется
+            print(f"--- [ПРОПУСК ПЕРЕВОДА]: Текст уже на английском ({english_prompt}), API Gemini не расходуется! ---")
+
+        # 3. Отправляем переведенный/исходный промпт в FLUX
+        encoded_prompt = requests.utils.quote(english_prompt)
+        image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&model=flux"
+        
+        response = requests.get(image_url, timeout=35)
+        
+        if response.status_code == 200:
+            base64_image = base64.b64encode(response.content).decode('utf-8')
+            print("--- УСПЕХ: Точное изображение сгенерировано! ---")
+            return jsonify({
+                "image": f"data:image/png;base64,{base64_image}",
+                "prompt": prompt
+            })
+        else:
+            print(f"[-] Ошибка генератора: статус {response.status_code}")
+            return jsonify({"error": "Не удалось сгенерировать изображение"}), 500
+
+    except Exception as e:
+        print(f"КРИТИЧЕСКАЯ ОШИБКА ГЕНЕРАЦИИ: {e}")
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
