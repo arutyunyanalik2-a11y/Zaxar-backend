@@ -3,6 +3,7 @@ import time
 import asyncio
 import re
 import base64 
+import io
 import requests
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
@@ -11,6 +12,7 @@ from google import genai
 from google.genai import types 
 import edge_tts
 from dotenv import load_dotenv
+from PIL import Image  # Оптимизация и сжатие изображений для мобильных
 
 # Находим точную папку
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -69,31 +71,36 @@ def detect_voice(text):
         return "en-US-BrianNeural"
 
 
-# --- 3. СИНХРОННАЯ ГЕНЕРАЦИЯ АУДИО ---
-def generate_audio_sync(text, output_path, voice):
-    async def tts_task():
+# --- 3. СИНХРОННАЯ ГЕНЕРАЦИЯ АУДИО (ИСПРАВЛЕННАЯ) ---
+async def _tts_async_task(text, output_path, voice):
+    try:
+        communicate = edge_tts.Communicate(text, voice)
+        await communicate.save(output_path)
+    except Exception as e:
         try:
-            communicate = edge_tts.Communicate(text, voice)
+            communicate = edge_tts.Communicate(text, "ru-RU-DmitryNeural")
             await communicate.save(output_path)
-        except Exception as e:
-            try:
-                communicate = edge_tts.Communicate(text, "ru-RU-DmitryNeural")
-                await communicate.save(output_path)
-            except Exception as e2:
-                print(f"Критический сбой TTS: {e2}")
+        except Exception as e2:
+            print(f"Критический сбой TTS: {e2}")
 
+def generate_audio_sync(text, output_path, voice):
+    # Очистка старых аудиофайлов
     try:
         for f in os.listdir(AUDIO_DIR):
             file_path = os.path.join(AUDIO_DIR, f)
             if f.endswith('.mp3') and file_path != output_path:
-                os.remove(file_path)
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
     except Exception as e:
         print(f"Ошибка очистки файлов: {e}")
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(tts_task())
-    loop.close()
+    # Безопасный запуск асинхронного TTS без падения GIL / event loop
+    try:
+        asyncio.run(_tts_async_task(text, output_path, voice))
+    except Exception as err:
+        print(f"Ошибка запуска asyncio в TTS: {err}")
 
 
 music_keywords = ["включи музыку", "поставь песню", "поставь музыку", "играй музыку", "play music"]
@@ -118,21 +125,32 @@ def assistant():
         
         if isinstance(user_message, list):
             for msg in user_message:
-                role = "Пользователь" if msg['role'] == 'user' else "Захар"
-                history_text += f"{role}: {msg['content']}\n"
+                if not isinstance(msg, dict):
+                    continue
+                role_name = msg.get('role', 'user')
+                content = msg.get('content', '')
+                role = "Пользователь" if role_name == 'user' else "Захар"
+                history_text += f"{role}: {content}\n"
                 
-                if msg['role'] == 'user':
-                    last_text_message = msg['content'].lower()
+                if role_name == 'user':
+                    last_text_message = str(content).lower()
                 
                 if msg.get('image'):
                     base64_str = msg['image']
-                    if "," in base64_str:
-                        mime_type_part, b64_data = base64_str.split(",", 1)
-                        mime_type = mime_type_part.split(":")[1].split(";")[0]
-                        img_bytes = base64.b64decode(b64_data)
+                    try:
+                        if "," in base64_str:
+                            mime_type_part, b64_data = base64_str.split(",", 1)
+                            mime_type = mime_type_part.split(":")[1].split(";")[0]
+                        else:
+                            b64_data = base64_str
+                            mime_type = "image/jpeg"
+                        
+                        img_bytes = base64.b64decode(b64_data.strip())
                         image_parts.append(
                             types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
                         )
+                    except Exception as img_err:
+                        print(f"Ошибка при обработке изображения из запроса: {img_err}")
         else:
             history_text = f"Пользователь: {user_message}"
             last_text_message = str(user_message).lower()
@@ -236,7 +254,7 @@ If this is the first message or a greeting, you MUST start with the welcome mess
         })
 
 
-# --- 100% БЕСПЛАТНАЯ ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ С ЗАЩИТОЙ ОТ ТАЙМАУТОВ ---
+# --- 100% БЕСПЛАТНАЯ ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ С ЗАЩИТОЙ ОТ ПАДЕНИЙ И СЖАТИЕМ ---
 @app.route('/api/generate-image', methods=['POST'])
 def generate_image():
     global client
@@ -276,22 +294,38 @@ def generate_image():
             except Exception as t_err:
                 print(f"Ошибка авто-перевода, используем оригинал: {t_err}")
         else:
-            print(f"--- [ПРОПУСК ПЕРЕВОДА]: Текст уже на английском ({english_prompt}), API Gemini не расходуется! ---")
+            print(f"--- [ПРОПУСК ПЕРЕВОДА]: Текст уже на английском ({english_prompt}) ---")
 
-        # 3. Отправляем промпт (размер 768x768 для ускорения ответа)
+        # 3. Отправляем промпт (размер 768x768 оптимизирован под мобильные экраны)
         encoded_prompt = requests.utils.quote(english_prompt)
         image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=768&height=768&nologo=true&model=flux"
         
-        # Устанавливаем таймаут 22 секунды, чтобы укладываться в ограничение сервера
         response = requests.get(image_url, timeout=22)
         
         if response.status_code == 200:
-            base64_image = base64.b64encode(response.content).decode('utf-8')
-            print("--- УСПЕХ: Изображение сгенерировано! ---")
-            return jsonify({
-                "image": f"data:image/png;base64,{base64_image}",
-                "prompt": prompt
-            })
+            # Сжимаем картинку до JPEG с качеством 85% для экономии памяти браузера
+            try:
+                img = Image.open(io.BytesIO(response.content))
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                
+                buffer = io.BytesIO()
+                img.save(buffer, format="JPEG", quality=85, optimize=True)
+                compressed_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                
+                print("--- УСПЕХ: Изображение сгенерировано и сжато! ---")
+                return jsonify({
+                    "image": f"data:image/jpeg;base64,{compressed_b64}",
+                    "prompt": prompt
+                })
+            except Exception as compress_err:
+                # Фоллбэк на сырой отклик, если Pillow сбоит
+                print(f"Ошибка сжатия изображения: {compress_err}")
+                base64_image = base64.b64encode(response.content).decode('utf-8')
+                return jsonify({
+                    "image": f"data:image/png;base64,{base64_image}",
+                    "prompt": prompt
+                })
         else:
             print(f"[-] Ошибка генератора: статус {response.status_code}")
             return jsonify({"error": "Сервер генерации перегружен. Повторите попытку через пару секунд."}), 503
